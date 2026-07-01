@@ -31,15 +31,26 @@ identical across firmware**, so the script confirms it empirically at runtime.
 
 ```
 python3 sync_controllogix_clock.py <ip>            # auto-detects and corrects
-python3 sync_controllogix_clock.py <ip> --dry-run  # measure only, no write
+python3 sync_controllogix_clock.py <ip> --dry-run  # read-only: previews the plan
 ```
 
-The delta the script relies on (attr6 − attr11) is stable even when the absolute
-clock is badly wrong, so a dead battery or never-set clock doesn't fool it.
+`--dry-run` is read-only **and predictive**: it reads attr 6 and attr 11 and
+reports the measured zone offset plus exactly what it would do, e.g.
+
+```
+[DRY RUN] auto: attr 11 (UTC source) = 2026-06-29 14:34:24, attr 6 (local) =
+2026-06-29 07:34:24, delta = -7.00 h -- would COMPENSATE so the UTC clock
+(attr 11) becomes ~2026-06-29 21:34:30.
+```
+
+So a single `--dry-run` tells you the offset, confirms attr 6 is readable, and
+shows the planned correction — no separate tool needed. The delta the script
+relies on (attr6 − attr11) is stable even when the absolute clock is badly wrong,
+so a dead battery or never-set clock doesn't fool it.
 
 ## Diagnosis / manual override (optional)
-Read-only probe (safe on a live controller), for when you want to see the raw
-attributes yourself:
+For a deeper look at every Wall Clock attribute, the read-only probe (safe on a
+live controller):
 ```
 python3 probe_wallclock.py <controller-ip> --slot <n>   # writes wallclock_probe_report.txt
 ```
