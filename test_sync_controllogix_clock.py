@@ -24,6 +24,7 @@ import logging
 import socket
 import unittest
 from datetime import datetime, timedelta, timezone
+from struct import pack, unpack_from
 from types import SimpleNamespace
 from unittest import mock
 
@@ -115,10 +116,67 @@ def make_fake_plc(
                 raise set_raises
             if set_applies:
                 self._offset = timedelta(0)
-            return FakeResponse(int(_utcnow().timestamp() * 1e6), status=set_status)
+            return FakeResponse(int((_utcnow() - mod.EPOCH).total_seconds() * 1e6), status=set_status)
 
     FakePLC.state = state
     return FakePLC
+
+
+def make_tz_fake(tz_hours=-7.0, start_skew_s=10.0):
+    """
+    Build a fake PLC that models the real bug: an internal UTC clock (attr 11)
+    and a configured time-zone offset, where the local attribute (attr 6) equals
+    UTC + tz_offset. Writing attr 6 sets local (so UTC = written - offset);
+    writing attr 11 sets UTC directly. Stock SetPLCTime writes server-UTC into
+    attr 6, which corrupts the UTC clock by exactly the zone offset.
+    """
+    tz_off_us = int(tz_hours * 3_600_000_000)
+
+    class TzFakePLC:
+        def __init__(self):
+            self.IPAddress = None
+            self.ProcessorSlot = None
+            self.SocketTimeout = None
+            # Start the controller's UTC clock skewed so a sync is triggered.
+            self.t_utc_us = int((_utcnow() - mod.EPOCH).total_seconds() * 1e6) + int(start_skew_s * 1e6)
+            self.writes = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def _attr_us(self, attr):
+            return self.t_utc_us if attr == mod.ATTR_CURRENT else self.t_utc_us + tz_off_us
+
+        def GetPLCTime(self, raw=False):
+            if raw:
+                return FakeResponse(self.t_utc_us, "Success")
+            return FakeResponse(mod.EPOCH + timedelta(microseconds=self.t_utc_us))
+
+        def SetPLCTime(self, dst=None):
+            self.writes += 1
+            # Stock write: server UTC lands in the LOCAL attribute (the bug).
+            self.t_utc_us = int((_utcnow() - mod.EPOCH).total_seconds() * 1e6) - tz_off_us
+            return FakeResponse(None, "Success")
+
+        def Message(self, service, cls, inst, attr=None, data=b""):
+            if service == mod.SVC_GET_ATTR_LIST:
+                val = self._attr_us(attr[0])
+                return FakeResponse(b"\x00" * mod.PAYLOAD_OFFSET + pack("<Q", val), "Success")
+            if service == mod.SVC_SET_ATTR_LIST:
+                self.writes += 1
+                for a, v in zip(attr, data):
+                    if a == mod.ATTR_CURRENT:
+                        self.t_utc_us = unpack_from("<Q", v, 0)[0]
+                    elif a == mod.ATTR_LOCAL:
+                        self.t_utc_us = unpack_from("<Q", v, 0)[0] - tz_off_us
+                    # attr 0x0A (DST) is accepted and ignored by the fake.
+                return FakeResponse(None, "Success")
+            raise AssertionError(f"unexpected CIP service 0x{service:02x}")
+
+    return TzFakePLC
 
 
 def make_args(**overrides):
@@ -311,6 +369,99 @@ class TestMain(Base):
         with mock.patch.object(mod, "import_pylogix", return_value=fake):
             rc = mod.main(["192.168.1.10", "--threshold-ms", "1000"])
         self.assertEqual(rc, mod.EXIT_OK)
+
+
+# --------------------------------------------------------------------------- #
+# Strategies: reproduce the bug on 'stock' and confirm the fixes resolve it
+# --------------------------------------------------------------------------- #
+class TestStrategies(Base):
+    def _sync(self, comm, strategy_name):
+        return mod.sync_once(
+            comm,
+            threshold_ms=1000.0,
+            verify_tol_ms=1000.0,
+            dry_run=False,
+            strategy=mod.STRATEGIES[strategy_name],
+        )
+
+    def test_stock_reproduces_timezone_offset(self):
+        # A controller with a -7h zone: stock write corrupts UTC, verify fails.
+        comm = make_tz_fake(tz_hours=-7.0)()
+        with self.assertRaises(mod.ClockSyncError):
+            self._sync(comm, "stock")
+
+    def test_utc_attr11_syncs_cleanly(self):
+        comm = make_tz_fake(tz_hours=-7.0)()
+        self.assertEqual(self._sync(comm, "utc-attr11"), mod.EXIT_OK)
+        self.assertGreaterEqual(comm.writes, 1)
+
+    def test_local_attr6_syncs_cleanly(self):
+        comm = make_tz_fake(tz_hours=-7.0)()
+        self.assertEqual(self._sync(comm, "local-attr6"), mod.EXIT_OK)
+        self.assertGreaterEqual(comm.writes, 1)
+
+    def test_calibrate_syncs_cleanly(self):
+        comm = make_tz_fake(tz_hours=-7.0)()
+        self.assertEqual(self._sync(comm, "calibrate"), mod.EXIT_OK)
+        self.assertGreaterEqual(comm.writes, 1)
+
+    def test_fixes_work_across_zones(self):
+        for tz in (-8.0, -5.0, 0.0, 5.5, 9.0):
+            for name in ("utc-attr11", "local-attr6", "calibrate"):
+                comm = make_tz_fake(tz_hours=tz)()
+                self.assertEqual(
+                    self._sync(comm, name), mod.EXIT_OK,
+                    msg=f"strategy {name} failed at tz={tz}",
+                )
+
+    def test_default_strategy_is_auto(self):
+        parser = mod.build_parser()
+        self.assertEqual(parser.parse_args(["1.2.3.4"]).strategy, "auto")
+
+    def test_auto_fixes_timezone_controller(self):
+        # The smart default corrects a -7h-zone controller with no flag at all.
+        comm = make_tz_fake(tz_hours=-7.0)()
+        self.assertEqual(self._sync(comm, "auto"), mod.EXIT_OK)
+        self.assertGreaterEqual(comm.writes, 1)
+
+    def test_auto_handles_all_zones(self):
+        for tz in (-8.0, -5.0, 0.0, 5.5, 5.75, 9.0):
+            comm = make_tz_fake(tz_hours=tz)()
+            self.assertEqual(
+                self._sync(comm, "auto"), mod.EXIT_OK, msg=f"auto failed at tz={tz}"
+            )
+
+    def test_auto_falls_back_when_attr6_unreadable(self):
+        # The plain fake has no Message() (raw attr-6 read). auto must degrade to
+        # the standard SetPLCTime write rather than error.
+        fake = make_fake_plc(offset_seconds=10.0, set_applies=True)
+        rc = self.run_with(fake, make_args(strategy="auto", max_retries=0))
+        self.assertEqual(rc, mod.EXIT_OK)
+        self.assertEqual(fake.state["set_calls"], 1)
+
+    def test_is_zone_offset_classifier(self):
+        hour = 3_600_000_000
+        self.assertTrue(mod._is_zone_offset(0))
+        self.assertTrue(mod._is_zone_offset(-7 * hour))
+        self.assertTrue(mod._is_zone_offset(int(5.5 * hour)))
+        self.assertTrue(mod._is_zone_offset(int(5.75 * hour)))  # Nepal +5:45
+        self.assertFalse(mod._is_zone_offset(int(2.13 * hour)))  # ~8 min off a quarter
+        self.assertFalse(mod._is_zone_offset(20 * hour))         # too large
+
+    def test_run_accepts_strategy_arg(self):
+        comm_factory = make_tz_fake(tz_hours=-7.0)
+        rc = self.run_with(comm_factory, make_args(strategy="utc-attr11", max_retries=0))
+        self.assertEqual(rc, mod.EXIT_OK)
+
+    def test_cli_parses_strategy_choice(self):
+        parser = mod.build_parser()
+        args = parser.parse_args(["1.2.3.4", "--strategy", "calibrate"])
+        self.assertEqual(args.strategy, "calibrate")
+
+    def test_cli_rejects_unknown_strategy(self):
+        parser = mod.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["1.2.3.4", "--strategy", "nonsense"])
 
 
 if __name__ == "__main__":
