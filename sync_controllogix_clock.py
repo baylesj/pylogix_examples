@@ -305,21 +305,50 @@ def _is_zone_offset(offset_us: int) -> bool:
     return abs(minutes - nearest_quarter) <= _ZONE_TOLERANCE_MIN
 
 
+def _fmt_us(us) -> str:
+    """Render epoch-microseconds as a readable naive datetime (or a placeholder)."""
+    if us is None:
+        return "<unreadable>"
+    return (EPOCH + timedelta(microseconds=us)).isoformat(sep=" ", timespec="seconds")
+
+
+def _auto_decision(comm) -> tuple:
+    """Read-only. Determine what the 'auto' strategy would do.
+
+    Returns (offset_us, a6_us, a11_us, verdict, detail) where verdict is one of:
+      'unread'   -- attr 6 could not be read (would fall back to standard write)
+      'not-zone' -- attr6-attr11 delta is not a plausible time zone (standard write)
+      'agree'    -- attr 6 and attr 11 match; no zone offset (standard write)
+      'zone'     -- a real zone offset was found (would compensate the write)
+    """
+    try:
+        a6 = _raw_read_attr_us(comm, ATTR_LOCAL)
+        a11 = _raw_read_attr_us(comm, ATTR_CURRENT)
+    except Exception as exc:  # attr 6 not readable on this build
+        return (None, None, None, "unread", str(exc))
+    offset_us = a6 - a11
+    if not _is_zone_offset(offset_us):
+        return (offset_us, a6, a11, "not-zone", "")
+    if round(offset_us / 900_000_000.0) == 0:  # within ~a quarter hour of zero
+        return (offset_us, a6, a11, "agree", "")
+    return (offset_us, a6, a11, "zone", "")
+
+
 def _write_auto(comm):
     """Smart default: detect the controller's own attr6-attr11 zone offset and,
     only if it is a plausible time zone, compensate the write so the UTC clock
     (attr 11) is set correctly. Otherwise fall back to the standard write."""
-    try:
-        offset_us = _raw_read_attr_us(comm, ATTR_LOCAL) - _raw_read_attr_us(comm, ATTR_CURRENT)
-    except Exception as exc:  # attr 6 not readable on this build -> standard write
+    offset_us, _a6, _a11, verdict, detail = _auto_decision(comm)
+
+    if verdict == "unread":
         log.info(
             "auto: could not read attr 6 to check for a zone offset (%s); "
-            "using the standard SetPLCTime write.", exc
+            "using the standard SetPLCTime write.", detail
         )
         return _write_stock(comm)
 
     offset_h = offset_us / 3_600_000_000.0
-    if not _is_zone_offset(offset_us):
+    if verdict == "not-zone":
         log.warning(
             "auto: the controller's attr6-attr11 delta (%+.2f h) is not a plausible "
             "time-zone offset; using the standard write WITHOUT compensating. "
@@ -327,7 +356,7 @@ def _write_auto(comm):
         )
         return _write_stock(comm)
 
-    if round(offset_us / 900_000_000.0) == 0:  # within ~a quarter hour of zero
+    if verdict == "agree":
         log.debug("auto: attr 6 and attr 11 agree (no zone offset); standard write.")
         return _write_stock(comm)
 
@@ -341,15 +370,37 @@ def _write_auto(comm):
     )
 
 
+def _preview_auto(comm) -> str:
+    """Read-only human description of what _write_auto would do (for --dry-run)."""
+    offset_us, a6, a11, verdict, detail = _auto_decision(comm)
+    if verdict == "unread":
+        return (
+            f"attr 6 is not readable on this controller ({detail}); would fall back to "
+            "the standard SetPLCTime write, which does NOT correct a zone offset -- "
+            "run probe_wallclock.py to investigate."
+        )
+    base = (
+        f"attr 11 (UTC source) = {_fmt_us(a11)}, attr 6 (local) = {_fmt_us(a6)}, "
+        f"delta = {offset_us / 3_600_000_000.0:+.2f} h"
+    )
+    if verdict == "not-zone":
+        return base + " -- not a plausible time zone; would write WITHOUT compensating."
+    if verdict == "agree":
+        return base + " -- attributes agree; would use the standard write."
+    target = _fmt_us(int(time.time() * 1_000_000))
+    return base + f" -- would COMPENSATE so the UTC clock (attr 11) becomes ~{target}."
+
+
 class ClockStrategy:
     """How to read, write, and time-base a controller clock sync."""
 
-    def __init__(self, name, basis, reads_attr, writer, description):
+    def __init__(self, name, basis, reads_attr, writer, description, preview_fn=None):
         self.name = name
         self.basis = basis                 # "UTC" or "LOCAL" (label + server basis)
         self.reads_attr = reads_attr       # ATTR_CURRENT via GetPLCTime, or ATTR_LOCAL raw
         self._writer = writer
         self.description = description
+        self._preview_fn = preview_fn
 
     def server_now(self) -> datetime:
         return utcnow() if self.basis == "UTC" else localnow()
@@ -357,12 +408,19 @@ class ClockStrategy:
     def write(self, comm):
         return self._writer(comm)
 
+    def preview(self, comm) -> str:
+        """Read-only description of what write() would do (for --dry-run)."""
+        if self._preview_fn is not None:
+            return self._preview_fn(comm)
+        return f"would write via the '{self.name}' strategy"
+
 
 STRATEGIES = {
     "auto": ClockStrategy(
         "auto", "UTC", ATTR_CURRENT, _write_auto,
         "Smart default: auto-detect the controller's zone offset and compensate "
         "only when it is a real time zone; otherwise behave like 'stock'.",
+        preview_fn=_preview_auto,
     ),
     "stock": ClockStrategy(
         "stock", "UTC", ATTR_CURRENT, _write_stock,
@@ -553,10 +611,17 @@ def sync_once(comm, threshold_ms: float, verify_tol_ms: float, dry_run: bool,
     if dry_run:
         log.warning(
             "[DRY RUN] Offset %.1f ms exceeds threshold %.0f ms; would set the "
-            "controller clock but --dry-run is active. No change made.",
+            "controller clock (strategy '%s') but --dry-run is active. No change made.",
             abs(offset_ms),
             threshold_ms,
+            strategy.name,
         )
+        # Preview is read-only; it reports what the write would do (for 'auto',
+        # this reads attr 6 so we can see the zone offset without writing).
+        try:
+            log.info("[DRY RUN] %s: %s", strategy.name, strategy.preview(comm))
+        except Exception as exc:  # never let a preview read abort a dry run
+            log.debug("Strategy preview unavailable: %s", exc)
         return EXIT_OK
 
     log.info(

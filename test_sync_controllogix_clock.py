@@ -439,6 +439,34 @@ class TestStrategies(Base):
         self.assertEqual(rc, mod.EXIT_OK)
         self.assertEqual(fake.state["set_calls"], 1)
 
+    def test_auto_dry_run_previews_offset_without_writing(self):
+        comm = make_tz_fake(tz_hours=-7.0)()
+        mod.log.setLevel(logging.INFO)
+        with self.assertLogs(mod.log, level="INFO") as cm:
+            rc = mod.sync_once(
+                comm, threshold_ms=1000.0, verify_tol_ms=1000.0, dry_run=True,
+                strategy=mod.STRATEGIES["auto"],
+            )
+        self.assertEqual(rc, mod.EXIT_OK)
+        self.assertEqual(comm.writes, 0)  # dry run must not write
+        output = "\n".join(cm.output)
+        self.assertIn("COMPENSATE", output)
+        self.assertIn("-7.00 h", output)
+
+    def test_auto_decision_reads_both_attributes(self):
+        comm = make_tz_fake(tz_hours=-7.0)()
+        offset_us, a6, a11, verdict, _ = mod._auto_decision(comm)
+        self.assertEqual(verdict, "zone")
+        self.assertAlmostEqual(offset_us / 3_600_000_000.0, -7.0, places=2)
+        self.assertIsNotNone(a6)
+        self.assertIsNotNone(a11)
+
+    def test_auto_preview_falls_back_when_attr6_unreadable(self):
+        fake = make_fake_plc(offset_seconds=10.0)  # no Message() method
+        comm = fake()
+        msg = mod.STRATEGIES["auto"].preview(comm)
+        self.assertIn("not readable", msg)
+
     def test_is_zone_offset_classifier(self):
         hour = 3_600_000_000
         self.assertTrue(mod._is_zone_offset(0))
